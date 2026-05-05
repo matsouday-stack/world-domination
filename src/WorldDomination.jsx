@@ -1,16 +1,8 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { db as firestoreDb } from "./firebase.js";
+import { doc as fsDoc, setDoc as fsSetDoc, getDoc as fsGetDoc } from "firebase/firestore";
 
-// ═══════════════════════════════════════ FIREBASE INTEGRATION ═══════════════
-let firestoreDb = null;
-let firestoreFns = null;
-(async () => {
-  try {
-    const fb = await import("./firebase.js");
-    const fs = await import("firebase/firestore");
-    firestoreDb = fb.db;
-    firestoreFns = { doc:fs.doc, setDoc:fs.setDoc, getDoc:fs.getDoc };
-  } catch (e) { console.log("Firebase not available, using local-only saves"); }
-})();
+const firestoreFns = { doc: fsDoc, setDoc: fsSetDoc, getDoc: fsGetDoc };
 
 // ═══════════════════════════════════════ STORAGE LAYER ══════════════════════
 // Compatible Capacitor (iOS prod) / localStorage (web) / Artifact / Memory
