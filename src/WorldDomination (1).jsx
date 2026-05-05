@@ -1,7 +1,19 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
+// ═══════════════════════════════════════ FIREBASE INTEGRATION ═══════════════
+let firestoreDb = null;
+let firestoreFns = null;
+(async () => {
+  try {
+    const fb = await import("./firebase.js");
+    const fs = await import("firebase/firestore");
+    firestoreDb = fb.db;
+    firestoreFns = { doc:fs.doc, setDoc:fs.setDoc, getDoc:fs.getDoc };
+  } catch (e) { console.log("Firebase not available, using local-only saves"); }
+})();
+
 // ═══════════════════════════════════════ STORAGE LAYER ══════════════════════
-// Compatible Capacitor (iOS prod) / Artifact (preview) / Memory (fallback)
+// Compatible Capacitor (iOS prod) / localStorage (web) / Artifact / Memory
 const _mem = {};
 const Storage = {
   async get(key) {
@@ -9,6 +21,9 @@ const Storage = {
       if (typeof window !== "undefined" && window.Capacitor?.Plugins?.Preferences) {
         const { value } = await window.Capacitor.Plugins.Preferences.get({ key });
         return value;
+      }
+      if (typeof window !== "undefined" && window.localStorage) {
+        return window.localStorage.getItem(key);
       }
       if (typeof window !== "undefined" && window.storage) {
         try { const r = await window.storage.get(key, false); return r?.value || null; } catch { return null; }
@@ -21,6 +36,9 @@ const Storage = {
       if (typeof window !== "undefined" && window.Capacitor?.Plugins?.Preferences) {
         await window.Capacitor.Plugins.Preferences.set({ key, value }); return true;
       }
+      if (typeof window !== "undefined" && window.localStorage) {
+        window.localStorage.setItem(key, value); return true;
+      }
       if (typeof window !== "undefined" && window.storage) {
         await window.storage.set(key, value, false); return true;
       }
@@ -32,13 +50,39 @@ const Storage = {
       if (typeof window !== "undefined" && window.Capacitor?.Plugins?.Preferences) {
         await window.Capacitor.Plugins.Preferences.remove({ key }); return;
       }
+      if (typeof window !== "undefined" && window.localStorage) {
+        window.localStorage.removeItem(key); return;
+      }
       if (typeof window !== "undefined" && window.storage) {
         await window.storage.delete(key, false); return;
       }
     } catch (e) {}
     delete _mem[key];
   },
-  // Shared storage for community content (only available in artifact preview / requires backend in iOS)
+  // ── Cloud save in Firestore (per-user, per-username)
+  async saveCloud(username, gameState) {
+    if (!firestoreDb || !firestoreFns || !username) return false;
+    try {
+      const ref = firestoreFns.doc(firestoreDb, "saves", username);
+      await firestoreFns.setDoc(ref, { ...gameState, savedAt: new Date().toISOString() });
+      return true;
+    } catch (e) {
+      console.warn("Cloud save failed:", e.message);
+      return false;
+    }
+  },
+  async loadCloud(username) {
+    if (!firestoreDb || !firestoreFns || !username) return null;
+    try {
+      const ref = firestoreFns.doc(firestoreDb, "saves", username);
+      const snap = await firestoreFns.getDoc(ref);
+      return snap.exists() ? snap.data() : null;
+    } catch (e) {
+      console.warn("Cloud load failed:", e.message);
+      return null;
+    }
+  },
+  // Shared storage for community content (artifact preview)
   async getShared(key) {
     try {
       if (typeof window !== "undefined" && window.storage) {
@@ -929,9 +973,115 @@ export default function WorldDomination() {
   const deleteAllData = useCallback(async () => {
     await Storage.remove("profile");
     await Storage.remove("reports");
+    await Storage.remove("gameState");
     setProfile(null);
     setScreen("welcome");
   }, []);
+
+  // ═══════════════════════════════════════ GAME SAVE / LOAD ═══════════════════
+  const [lastSaveTime, setLastSaveTime] = useState(null);
+  const [saveStatus, setSaveStatus] = useState("idle"); // idle | saving | saved | error
+  const [hasLoadedSave, setHasLoadedSave] = useState(false);
+
+  // Build a snapshot of the entire game state
+  const buildGameState = useCallback(() => ({
+    version: 1,
+    cells, res, wks, buildingLv, pendingRes, marches, gatherQ, capProg,
+    rp, prestige, tech, researchQueue, storm,
+    chestNextAt, chest, raidNextAt, incomingRaid,
+    collectCooldown, adShopCooldown, adShopAdsWatched, adSpeedActive, resourceReminder,
+    mapSeed,
+    savedAt: Date.now(),
+  }), [cells, res, wks, buildingLv, pendingRes, marches, gatherQ, capProg, rp, prestige, tech, researchQueue, storm, chestNextAt, chest, raidNextAt, incomingRaid, collectCooldown, adShopCooldown, adShopAdsWatched, adSpeedActive, resourceReminder, mapSeed]);
+
+  // Save game (local always + cloud if username available)
+  const saveGame = useCallback(async () => {
+    if (!profile?.username) return; // No save without profile
+    setSaveStatus("saving");
+    try {
+      const state = buildGameState();
+      const json = JSON.stringify(state);
+      // Always save locally first (instant + works offline)
+      await Storage.set("gameState", json);
+      // Try cloud save in background (don't block UI)
+      Storage.saveCloud(profile.username, state).then((ok) => {
+        setSaveStatus(ok ? "saved" : "saved-local");
+        setLastSaveTime(Date.now());
+        setTimeout(() => setSaveStatus("idle"), 2000);
+      });
+      setLastSaveTime(Date.now());
+    } catch (e) {
+      console.warn("Save failed:", e);
+      setSaveStatus("error");
+      setTimeout(() => setSaveStatus("idle"), 2000);
+    }
+  }, [profile, buildGameState]);
+
+  // Load game on first profile load
+  useEffect(() => {
+    if (!profile?.username || hasLoadedSave) return;
+    (async () => {
+      try {
+        // Try cloud first, then local
+        let state = await Storage.loadCloud(profile.username);
+        if (!state) {
+          const raw = await Storage.get("gameState");
+          if (raw) state = JSON.parse(raw);
+        }
+        if (state && state.version === 1) {
+          // Restore game state
+          if (state.cells)       setCells(state.cells);
+          if (state.res)         setRes(state.res);
+          if (state.wks)         setWks(state.wks);
+          if (state.buildingLv)  setBuildingLv(state.buildingLv);
+          if (state.pendingRes)  setPendingRes(state.pendingRes);
+          if (state.marches)     setMarches(state.marches);
+          if (state.gatherQ)     setGatherQ(state.gatherQ);
+          if (state.capProg)     setCapProg(state.capProg);
+          if (typeof state.rp === "number")       setRp(state.rp);
+          if (typeof state.prestige === "number") setPrestige(state.prestige);
+          if (state.tech)              setTech(state.tech);
+          if (state.researchQueue !== undefined)  setResearchQueue(state.researchQueue);
+          if (typeof state.storm === "number")    setStorm(state.storm);
+          if (typeof state.chestNextAt === "number") setChestNextAt(state.chestNextAt);
+          if (state.chest !== undefined)           setChest(state.chest);
+          if (typeof state.raidNextAt === "number") setRaidNextAt(state.raidNextAt);
+          if (state.incomingRaid !== undefined)    setIncomingRaid(state.incomingRaid);
+          if (typeof state.collectCooldown === "number") setCollectCooldown(state.collectCooldown);
+          if (typeof state.adShopCooldown === "number")  setAdShopCooldown(state.adShopCooldown);
+          if (typeof state.adShopAdsWatched === "number")setAdShopAdsWatched(state.adShopAdsWatched);
+          if (state.adSpeedActive)                       setAdSpeedActive(state.adSpeedActive);
+          if (typeof state.resourceReminder === "number") setResourceReminder(state.resourceReminder);
+          notify("✅ Partie restaurée !", "good");
+        }
+      } catch (e) { console.warn("Load failed:", e); }
+      setHasLoadedSave(true);
+    })();
+  }, [profile, hasLoadedSave]);
+
+  // Auto-save every 30 seconds
+  useEffect(() => {
+    if (!profile?.username || !hasLoadedSave) return;
+    const iv = setInterval(() => { saveGame(); }, 30000);
+    return () => clearInterval(iv);
+  }, [profile, hasLoadedSave, saveGame]);
+
+  // Save before leaving page
+  useEffect(() => {
+    if (!profile?.username) return;
+    const handler = () => {
+      try {
+        const state = buildGameState();
+        const json = JSON.stringify(state);
+        if (typeof window !== "undefined" && window.localStorage) {
+          window.localStorage.setItem("gameState", json);
+        }
+      } catch {}
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [profile, buildGameState]);
+  // ═══════════════════════════════════════
 
   const rRef = useRef(res); const cRef = useRef(cells); const wRef = useRef(wks);
   const tRef = useRef(tech); const pRef = useRef(prestige); const sRef = useRef(storm);
@@ -1626,6 +1776,19 @@ export default function WorldDomination() {
             }}>
               🛍️ {adShopCooldown===0 ? "BOUTIQUE" : `${Math.ceil(adShopCooldown/60)}min`}
             </button>
+            {/* Save indicator */}
+            <div style={{
+              fontSize:9, fontFamily:"Orbitron",
+              color: saveStatus==="saving"?"#fbbf24":saveStatus==="saved"?"#4ade80":saveStatus==="saved-local"?"#60a5fa":saveStatus==="error"?"#ef4444":"#475569",
+              letterSpacing:1, transition:"color .3s",
+              display:"flex",alignItems:"center",gap:3,
+            }}>
+              {saveStatus==="saving" && <>💾 SAUVE...</>}
+              {saveStatus==="saved" && <>✅ ☁️ CLOUD</>}
+              {saveStatus==="saved-local" && <>✅ 📱 LOCAL</>}
+              {saveStatus==="error" && <>⚠️ ERREUR</>}
+              {saveStatus==="idle" && lastSaveTime && <>💾 {Math.max(0,Math.floor((Date.now()-lastSaveTime)/1000))}s</>}
+            </div>
           </div>
         </div>
       </div>
