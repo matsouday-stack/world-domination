@@ -1052,16 +1052,18 @@ export default function WorldDomination() {
   }, [profile, hasLoadedSave]);
 
   // Auto-save every 30 seconds
+  const saveGameRef = useRef(saveGame);
+  useEffect(() => { saveGameRef.current = saveGame; }, [saveGame]);
   useEffect(() => {
     if (!profile?.username || !hasLoadedSave) return;
-    const iv = setInterval(() => { saveGame(); }, 30000);
+    const iv = setInterval(() => { saveGameRef.current(); }, 30000);
     return () => clearInterval(iv);
-  }, [profile, hasLoadedSave, saveGame]);
+  }, [profile, hasLoadedSave]);
 
-  // Save before leaving page
+  // Save before leaving page — covers desktop (beforeunload) + mobile (pagehide, visibilitychange)
   useEffect(() => {
     if (!profile?.username) return;
-    const handler = () => {
+    const syncSave = () => {
       try {
         const state = buildGameState();
         const json = JSON.stringify(state);
@@ -1070,8 +1072,15 @@ export default function WorldDomination() {
         }
       } catch {}
     };
-    window.addEventListener("beforeunload", handler);
-    return () => window.removeEventListener("beforeunload", handler);
+    const onVisibilityChange = () => { if (document.visibilityState === "hidden") syncSave(); };
+    window.addEventListener("beforeunload", syncSave);
+    window.addEventListener("pagehide", syncSave);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("beforeunload", syncSave);
+      window.removeEventListener("pagehide", syncSave);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
   }, [profile, buildGameState]);
   // ═══════════════════════════════════════
 
