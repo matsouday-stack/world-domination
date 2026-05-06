@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { db as firestoreDb } from "./firebase.js";
+import { db as firestoreDb, auth as firebaseAuth } from "./firebase.js";
 import { doc as fsDoc, setDoc as fsSetDoc, getDoc as fsGetDoc } from "firebase/firestore";
+import { signInAnonymously, onAuthStateChanged } from "firebase/auth";
 
 const firestoreFns = { doc: fsDoc, setDoc: fsSetDoc, getDoc: fsGetDoc };
 
@@ -51,26 +52,42 @@ const Storage = {
     } catch (e) {}
     delete _mem[key];
   },
-  // ── Cloud save in Firestore (per-user, per-username)
-  async saveCloud(username, gameState) {
-    if (!firestoreDb || !firestoreFns || !username) return false;
+  // ── Cloud save in Firestore (per-user, keyed by Firebase Auth UID)
+  // username is stored as a display field for leaderboards but is NOT the key
+  async saveCloud(userId, gameState, username) {
+    if (!firestoreDb || !firestoreFns || !userId) return false;
     try {
-      const ref = firestoreFns.doc(firestoreDb, "saves", username);
-      await firestoreFns.setDoc(ref, { ...gameState, savedAt: new Date().toISOString() });
+      const ref = firestoreFns.doc(firestoreDb, "saves", userId);
+      await firestoreFns.setDoc(ref, {
+        ...gameState,
+        username: username || gameState.username || null,
+        savedAt: new Date().toISOString(),
+      });
       return true;
     } catch (e) {
       console.warn("Cloud save failed:", e.message);
       return false;
     }
   },
-  async loadCloud(username) {
+  async loadCloud(userId) {
+    if (!firestoreDb || !firestoreFns || !userId) return null;
+    try {
+      const ref = firestoreFns.doc(firestoreDb, "saves", userId);
+      const snap = await firestoreFns.getDoc(ref);
+      return snap.exists() ? snap.data() : null;
+    } catch (e) {
+      console.warn("Cloud load failed:", e.message);
+      return null;
+    }
+  },
+  // Legacy: load by username (used once for migration from old saves)
+  async loadCloudByUsername(username) {
     if (!firestoreDb || !firestoreFns || !username) return null;
     try {
       const ref = firestoreFns.doc(firestoreDb, "saves", username);
       const snap = await firestoreFns.getDoc(ref);
       return snap.exists() ? snap.data() : null;
     } catch (e) {
-      console.warn("Cloud load failed:", e.message);
       return null;
     }
   },
@@ -974,6 +991,24 @@ export default function WorldDomination() {
   const [lastSaveTime, setLastSaveTime] = useState(null);
   const [saveStatus, setSaveStatus] = useState("idle"); // idle | saving | saved | error
   const [hasLoadedSave, setHasLoadedSave] = useState(false);
+  const [userId, setUserId] = useState(null); // Firebase Auth UID (unique per device)
+
+  // ── Firebase Anonymous Auth: each device gets a unique UID
+  // This prevents two players with the same username from overwriting each other's saves
+  useEffect(() => {
+    if (!firebaseAuth) return;
+    const unsubscribe = onAuthStateChanged(firebaseAuth, (user) => {
+      if (user) {
+        setUserId(user.uid);
+      } else {
+        // No user yet: sign in anonymously
+        signInAnonymously(firebaseAuth).catch((e) => {
+          console.warn("Anonymous sign-in failed:", e.message);
+        });
+      }
+    });
+    return () => unsubscribe();
+  }, []);
 
   // Build a snapshot of the entire game state
   const buildGameState = useCallback(() => ({
@@ -986,7 +1021,7 @@ export default function WorldDomination() {
     savedAt: Date.now(),
   }), [cells, res, wks, buildingLv, pendingRes, marches, gatherQ, capProg, rp, prestige, tech, researchQueue, storm, chestNextAt, chest, raidNextAt, incomingRaid, collectCooldown, adShopCooldown, adShopAdsWatched, adSpeedActive, resourceReminder, mapSeed]);
 
-  // Save game (local always + cloud if username available)
+  // Save game (local always + cloud if userId available)
   const saveGame = useCallback(async () => {
     if (!profile?.username) return; // No save without profile
     setSaveStatus("saving");
@@ -995,27 +1030,42 @@ export default function WorldDomination() {
       const json = JSON.stringify(state);
       // Always save locally first (instant + works offline)
       await Storage.set("gameState", json);
-      // Try cloud save in background (don't block UI)
-      Storage.saveCloud(profile.username, state).then((ok) => {
-        setSaveStatus(ok ? "saved" : "saved-local");
-        setLastSaveTime(Date.now());
+      // Try cloud save in background (don't block UI) — keyed by Auth UID, not username
+      if (userId) {
+        Storage.saveCloud(userId, state, profile.username).then((ok) => {
+          setSaveStatus(ok ? "saved" : "saved-local");
+          setLastSaveTime(Date.now());
+          setTimeout(() => setSaveStatus("idle"), 2000);
+        });
+      } else {
+        setSaveStatus("saved-local");
         setTimeout(() => setSaveStatus("idle"), 2000);
-      });
+      }
       setLastSaveTime(Date.now());
     } catch (e) {
       console.warn("Save failed:", e);
       setSaveStatus("error");
       setTimeout(() => setSaveStatus("idle"), 2000);
     }
-  }, [profile, buildGameState]);
+  }, [profile, buildGameState, userId]);
 
-  // Load game on first profile load
+  // Load game once profile + auth UID are both ready
   useEffect(() => {
     if (!profile?.username || hasLoadedSave) return;
+    if (!userId) return; // wait for Firebase Auth to give us a UID
     (async () => {
       try {
-        // Try cloud first, then local
-        let state = await Storage.loadCloud(profile.username);
+        // 1) Try cloud (by UID — the new way)
+        let state = await Storage.loadCloud(userId);
+        // 2) Legacy migration: if no UID-keyed save, try old username-keyed save
+        if (!state) {
+          const legacy = await Storage.loadCloudByUsername(profile.username);
+          if (legacy) {
+            state = legacy;
+            console.log("Migrating legacy save from username to UID...");
+          }
+        }
+        // 3) Fallback to local
         if (!state) {
           const raw = await Storage.get("gameState");
           if (raw) state = JSON.parse(raw);
@@ -1049,7 +1099,7 @@ export default function WorldDomination() {
       } catch (e) { console.warn("Load failed:", e); }
       setHasLoadedSave(true);
     })();
-  }, [profile, hasLoadedSave]);
+  }, [profile, hasLoadedSave, userId]);
 
   // Auto-save every 30 seconds
   const saveGameRef = useRef(saveGame);
