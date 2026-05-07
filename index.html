@@ -5,6 +5,26 @@
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>world-domination</title>
+
+    <!-- GameMonetize SDK — rewarded video ads (Magic Chest, Ad Shop, Speed Boost) -->
+    <script>
+      window.SDK_OPTIONS = {
+        gameId: "o75ycmljf6aps5l4ydloawhlu8qifxcf",
+        onEvent: function (a) {
+          // Forward SDK events to the React app via custom DOM events
+          window.dispatchEvent(new CustomEvent("gm-sdk-event", { detail: a }));
+        },
+      };
+      (function (a, b, c) {
+        var d = a.getElementsByTagName(b)[0];
+        if (a.getElementById(c)) return;
+        var e = a.createElement(b);
+        e.id = c;
+        e.src = "https://api.gamemonetize.com/sdk.js";
+        e.async = true;
+        d.parentNode.insertBefore(e, d);
+      })(document, "script", "gamemonetize-sdk");
+    </script>
   </head>
   <body>
     <div id="root"></div>

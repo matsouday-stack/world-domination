@@ -1692,29 +1692,69 @@ export default function WorldDomination() {
 
   const openAdShop = () => setShowAdShop(true);
 
+  // ── GameMonetize SDK helper ─────────────────────────────────────────
+  // Plays a real rewarded video ad if the GameMonetize SDK is available.
+  // Falls back to immediate completion if the SDK is blocked / unavailable
+  // (so adblock users still get their reward — better UX than a hard fail).
+  const playRealAd = useCallback((onComplete) => {
+    if (typeof window === "undefined") return onComplete();
+    const sdk = window.sdk || window.GameMonetize;
+    if (!sdk || typeof sdk.showBanner !== "function") {
+      // SDK not ready (yet) — give the reward anyway
+      return onComplete();
+    }
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      window.removeEventListener("gm-sdk-event", handler);
+      clearTimeout(safety);
+      onComplete();
+    };
+    const handler = (e) => {
+      const name = e?.detail?.name;
+      // Both event names work depending on SDK version
+      if (name === "SDK_GAME_START" || name === "SDK_REWARDED_WATCH_COMPLETE" || name === "AD_ERROR") {
+        finish();
+      }
+    };
+    window.addEventListener("gm-sdk-event", handler);
+    // Safety fallback if no event arrives within 35s (closed ad, network issue…)
+    const safety = setTimeout(finish, 35000);
+    try {
+      sdk.showBanner();
+    } catch (err) {
+      finish();
+    }
+  }, []);
+
   const watchAdForShop = () => {
     if (adShopCooldown > 0) return notify(`Boutique disponible dans ${Math.ceil(adShopCooldown/60)}min`, "bad");
-    const next = adShopAdsWatched + 1;
-    if (next >= 2) {
-      // 2 pubs regardées → 1 coffre magique
-      const pZones = cells.filter(c=>c.owner==="player"&&!c.isBase).length;
-      const rewards = generateChestRewards(pZones, prestige);
-      setChest({ rewards, opened: false });
-      setAdShopAdsWatched(0);
-      setAdShopCooldown(900); // 15 min cooldown
-      setShowAdShop(false);
-      notify("🎁 Coffre magique obtenu ! (2 pubs regardées)", "jackpot");
-    } else {
-      setAdShopAdsWatched(next);
-      notify(`📺 Pub ${next}/2 regardée ! Encore 1 pour obtenir le coffre.`, "good");
-    }
+    playRealAd(() => {
+      const next = adShopAdsWatched + 1;
+      if (next >= 2) {
+        // 2 pubs regardées → 1 coffre magique
+        const pZones = cells.filter(c=>c.owner==="player"&&!c.isBase).length;
+        const rewards = generateChestRewards(pZones, prestige);
+        setChest({ rewards, opened: false });
+        setAdShopAdsWatched(0);
+        setAdShopCooldown(900); // 15 min cooldown
+        setShowAdShop(false);
+        notify("🎁 Coffre magique obtenu ! (2 pubs regardées)", "jackpot");
+      } else {
+        setAdShopAdsWatched(next);
+        notify(`📺 Pub ${next}/2 regardée ! Encore 1 pour obtenir le coffre.`, "good");
+      }
+    });
   };
 
   const watchAdSpeedBoost = (marchId) => {
     if ((adSpeedActive[marchId]||0) > 0) return notify(`Disponible dans ${Math.ceil(adSpeedActive[marchId]/60)}min`, "bad");
-    setMarches(prev => prev.map(m => m.id===marchId ? {...m, timeLeft: Math.max(10, m.timeLeft-60)} : m));
-    setAdSpeedActive(prev => ({...prev, [marchId]: 300})); // 5 min cooldown per march
-    notify("⚡ -1 minute retirée de l'attaque !", "good");
+    playRealAd(() => {
+      setMarches(prev => prev.map(m => m.id===marchId ? {...m, timeLeft: Math.max(10, m.timeLeft-60)} : m));
+      setAdSpeedActive(prev => ({...prev, [marchId]: 300})); // 5 min cooldown per march
+      notify("⚡ -1 minute retirée de l'attaque !", "good");
+    });
   };
 
   const dismissLostZone = () => setLostZoneAnim(null);
@@ -4896,13 +4936,31 @@ function MagicChest({ chest, openChest, claimChest, dismiss, C }) {
   }, [showAd, adComplete]);
 
   const handleWatchAd = () => {
+    // If GameMonetize SDK is loaded → play the real rewarded video,
+    // then open the chest when the ad finishes.
+    const sdk = (typeof window !== "undefined") && (window.sdk || window.GameMonetize);
+    if (sdk && typeof sdk.showBanner === "function") {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        window.removeEventListener("gm-sdk-event", handler);
+        clearTimeout(safety);
+        openChest();
+      };
+      const handler = (e) => {
+        const name = e?.detail?.name;
+        if (name === "SDK_GAME_START" || name === "SDK_REWARDED_WATCH_COMPLETE" || name === "AD_ERROR") finish();
+      };
+      window.addEventListener("gm-sdk-event", handler);
+      const safety = setTimeout(finish, 35000);
+      try { sdk.showBanner(); } catch (err) { finish(); }
+      return;
+    }
+    // Fallback: original 5s simulated ad UI (works offline / with adblock)
     setShowAd(true);
     setAdProgress(0);
     setAdComplete(false);
-    // 📺 IMPLÉMENTATION ADMOB FUTURE :
-    // Sur Android/iOS via Capacitor + plugin admob, remplacer cette simulation par :
-    //   AdMob.showRewardVideoAd().then(() => { setAdComplete(true); openChest(); })
-    // Voir DEPLOIEMENT_AdMob.md pour les détails
   };
 
   const handleAdComplete = () => {
