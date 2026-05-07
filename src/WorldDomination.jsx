@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { db as firestoreDb, auth as firebaseAuth } from "./firebase.js";
 import { doc as fsDoc, setDoc as fsSetDoc, getDoc as fsGetDoc } from "firebase/firestore";
-import { signInAnonymously, onAuthStateChanged } from "firebase/auth";
+import { signInAnonymously, onAuthStateChanged, setPersistence, browserLocalPersistence } from "firebase/auth";
 
 const firestoreFns = { doc: fsDoc, setDoc: fsSetDoc, getDoc: fsGetDoc };
 
@@ -997,6 +997,10 @@ export default function WorldDomination() {
   // This prevents two players with the same username from overwriting each other's saves
   useEffect(() => {
     if (!firebaseAuth) return;
+    // Force local persistence so the UID survives a page refresh.
+    // (In sandboxed iframes — itch.io, GameMonetize — this may fall back to
+    // in-memory persistence; the load logic handles that gracefully.)
+    setPersistence(firebaseAuth, browserLocalPersistence).catch(() => {});
     const unsubscribe = onAuthStateChanged(firebaseAuth, (user) => {
       if (user) {
         setUserId(user.uid);
@@ -1049,14 +1053,20 @@ export default function WorldDomination() {
     }
   }, [profile, buildGameState, userId]);
 
-  // Load game once profile + auth UID are both ready
+  // Load game once profile is ready. Don't block on userId — Firebase Auth
+  // can fail in cross-origin iframes (itch.io, GameMonetize). We wait up to
+  // 2.5s for the UID then load from local fallback regardless.
   useEffect(() => {
     if (!profile?.username || hasLoadedSave) return;
-    if (!userId) return; // wait for Firebase Auth to give us a UID
-    (async () => {
+    let cancelled = false;
+    const performLoad = async () => {
+      if (cancelled) return;
       try {
-        // 1) Try cloud (by UID — the new way)
-        let state = await Storage.loadCloud(userId);
+        let state = null;
+        // 1) Try cloud (by UID — the new way) IF auth gave us a UID
+        if (userId) {
+          state = await Storage.loadCloud(userId);
+        }
         // 2) Legacy migration: if no UID-keyed save, try old username-keyed save
         if (!state) {
           const legacy = await Storage.loadCloudByUsername(profile.username);
@@ -1065,7 +1075,7 @@ export default function WorldDomination() {
             console.log("Migrating legacy save from username to UID...");
           }
         }
-        // 3) Fallback to local
+        // 3) Fallback to local (always works, even in iframes with blocked cookies)
         if (!state) {
           const raw = await Storage.get("gameState");
           if (raw) state = JSON.parse(raw);
@@ -1097,8 +1107,17 @@ export default function WorldDomination() {
           notify("✅ Partie restaurée !", "good");
         }
       } catch (e) { console.warn("Load failed:", e); }
-      setHasLoadedSave(true);
-    })();
+      if (!cancelled) setHasLoadedSave(true);
+    };
+    // If we already have a UID, load immediately. Otherwise wait up to 2.5s
+    // for Firebase Auth, then load from local-only.
+    let timer;
+    if (userId) {
+      performLoad();
+    } else {
+      timer = setTimeout(performLoad, 2500);
+    }
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
   }, [profile, hasLoadedSave, userId]);
 
   // Auto-save every 30 seconds
